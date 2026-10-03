@@ -1,7 +1,8 @@
 {%- comment -%}
-  Estimated delivery date checker powered by the Delhivery Expected TAT API.
-  The Delhivery token must never be exposed in the storefront, so this block
-  calls a small proxy (see delhivery-proxy/worker.js) that adds the token.
+  Estimated delivery date checker.
+  - With a Proxy URL: uses the Delhivery Expected TAT API via delhivery-proxy/worker.js
+    (the Delhivery token must never be exposed in the storefront).
+  - Without a Proxy URL: uses the pincode-prefix rules below. No API, no backend.
 {%- endcomment -%}
 
 <delivery-estimate
@@ -12,6 +13,8 @@
   data-processing-days="{{ block.settings.processing_days }}"
   data-cutoff-hour="{{ block.settings.cutoff_hour }}"
   data-success-text="{{ block.settings.success_text | escape }}"
+  data-zone-rules="{{ block.settings.zone_rules | escape }}"
+  data-default-days="{{ block.settings.default_days }}"
   style="{% render 'spacing-style', settings: block.settings %}"
   {{ block.shopify_attributes }}
 >
@@ -118,14 +121,26 @@
         }
 
         const { endpoint, originPin, mot } = this.dataset;
-        if (!endpoint || !originPin) {
+        const pickup = this.#pickupDate();
+
+        if (!endpoint) {
+          const days = this.#zoneDays(pin);
+          if (days == null) {
+            this.#show('Sorry, we do not deliver to this pincode yet.', 'error');
+          } else {
+            this.#remember(pin);
+            this.#showDate(pickup, days, pin);
+          }
+          return;
+        }
+
+        if (!originPin) {
           this.#show('Delivery estimate is not configured yet.', 'error');
           return;
         }
 
         this.#show('Checking…', 'loading');
 
-        const pickup = this.#pickupDate();
         const url = new URL(endpoint);
         url.searchParams.set('origin_pin', originPin);
         url.searchParams.set('destination_pin', pin);
@@ -143,22 +158,45 @@
             return;
           }
 
-          try {
-            localStorage.setItem(STORAGE_KEY, pin);
-          } catch {}
-
-          const delivery = new Date(pickup);
-          delivery.setDate(delivery.getDate() + tat);
-          const formatted = delivery.toLocaleDateString(document.documentElement.lang || 'en-IN', {
-            weekday: 'short',
-            day: 'numeric',
-            month: 'short',
-          });
-          const template = this.dataset.successText || 'Estimated delivery by [date]';
-          this.#show(template.replace('[date]', formatted).replace('[pincode]', pin), 'success');
+          this.#remember(pin);
+          this.#showDate(pickup, tat, pin);
         } catch {
           this.#show('Could not fetch delivery estimate. Please try again.', 'error');
         }
+      }
+
+      // Rules are "prefix:days" per line; the longest matching prefix wins.
+      // "prefix:0" or "prefix:no" marks a pincode range as not serviceable.
+      #zoneDays(pin) {
+        let best = null;
+        for (const line of (this.dataset.zoneRules || '').split(/[\n,]+/)) {
+          const [prefix, value] = line.split(':').map((part) => part?.trim());
+          if (!prefix || !/^[0-9]+$/.test(prefix) || !pin.startsWith(prefix)) continue;
+          if (best && best.prefix.length >= prefix.length) continue;
+          const days = Number(value);
+          best = { prefix, days: Number.isFinite(days) && days > 0 ? days : null };
+        }
+        if (best) return best.days;
+        const fallback = Number(this.dataset.defaultDays);
+        return Number.isFinite(fallback) && fallback > 0 ? fallback : null;
+      }
+
+      #remember(pin) {
+        try {
+          localStorage.setItem(STORAGE_KEY, pin);
+        } catch {}
+      }
+
+      #showDate(pickup, days, pin) {
+        const delivery = new Date(pickup);
+        delivery.setDate(delivery.getDate() + days);
+        const formatted = delivery.toLocaleDateString(document.documentElement.lang || 'en-IN', {
+          weekday: 'short',
+          day: 'numeric',
+          month: 'short',
+        });
+        const template = this.dataset.successText || 'Estimated delivery by [date]';
+        this.#show(template.replace('[date]', formatted).replace('[pincode]', pin), 'success');
       }
 
       // Delhivery returns TAT (in days) under data.tat; tolerate a few shapes.
@@ -210,19 +248,44 @@
   "settings": [
     {
       "type": "paragraph",
-      "content": "Shows an estimated delivery date using the Delhivery Expected TAT API. Requires the proxy in delhivery-proxy/worker.js so your API token stays private."
+      "content": "Shows an estimated delivery date. Leave Proxy URL empty to use the pincode rules below (no API needed). Add a Proxy URL to use live Delhivery TAT instead."
+    },
+    {
+      "type": "header",
+      "content": "Pincode rules (no API)"
+    },
+    {
+      "type": "textarea",
+      "id": "zone_rules",
+      "label": "Delivery days by pincode prefix",
+      "info": "One per line as prefix:days. Longest prefix wins. Use prefix:0 to block a range. Defaults assume shipping from Palakkad (679501).",
+      "default": "679:2\n678:3\n67:3\n68:3\n69:3\n6:5\n5:5\n4:6\n1:7\n2:7\n3:7\n7:8\n8:8\n9:8"
+    },
+    {
+      "type": "range",
+      "id": "default_days",
+      "label": "Fallback delivery days",
+      "info": "Used when no rule matches. Set 0 to show not serviceable.",
+      "min": 0,
+      "max": 15,
+      "step": 1,
+      "default": 7
+    },
+    {
+      "type": "header",
+      "content": "Live Delhivery TAT (optional)"
     },
     {
       "type": "url",
       "id": "proxy_url",
       "label": "Proxy URL",
-      "info": "e.g. https://delhivery-tat.your-name.workers.dev"
+      "info": "Leave empty to use pincode rules. e.g. https://delhivery-tat.your-name.workers.dev"
     },
     {
       "type": "text",
       "id": "origin_pin",
       "label": "Warehouse (origin) pincode",
-      "default": "110001"
+      "default": "679501"
     },
     {
       "type": "select",

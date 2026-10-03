@@ -36,3 +36,9 @@ Theme editor → Product page → **Add block → Delivery estimate**, then fill
 Estimated date = pickup date + TAT days returned by Delhivery.
 
 This folder isn't part of the theme. It's listed in `.shopifyignore`.
+
+## No-API mode
+
+Leave **Proxy URL** empty and the block uses the **Delivery days by pincode
+prefix** rules instead (for example `679:2`, `67:3`, `1:7`). The longest prefix wins, and `prefix:0`
+blocks a range. This is pure Liquid, CSS and JS, with no token, no proxy and no running cost.
