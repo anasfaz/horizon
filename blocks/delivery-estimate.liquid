@@ -1,0 +1,336 @@
+{%- comment -%}
+  Estimated delivery date checker powered by the Delhivery Expected TAT API.
+  The Delhivery token must never be exposed in the storefront, so this block
+  calls a small proxy (see delhivery-proxy/worker.js) that adds the token.
+{%- endcomment -%}
+
+<delivery-estimate
+  class="delivery-estimate spacing-style"
+  data-endpoint="{{ block.settings.proxy_url | escape }}"
+  data-origin-pin="{{ block.settings.origin_pin | escape }}"
+  data-mot="{{ block.settings.mot }}"
+  data-processing-days="{{ block.settings.processing_days }}"
+  data-cutoff-hour="{{ block.settings.cutoff_hour }}"
+  data-success-text="{{ block.settings.success_text | escape }}"
+  style="{% render 'spacing-style', settings: block.settings %}"
+  {{ block.shopify_attributes }}
+>
+  {%- if block.settings.heading != blank -%}
+    <p class="delivery-estimate__heading">{{ block.settings.heading }}</p>
+  {%- endif -%}
+
+  <form class="delivery-estimate__form" novalidate>
+    <label class="visually-hidden" for="DeliveryPin-{{ block.id }}">Pincode</label>
+    <input
+      id="DeliveryPin-{{ block.id }}"
+      class="delivery-estimate__input"
+      type="text"
+      inputmode="numeric"
+      autocomplete="postal-code"
+      pattern="[1-9][0-9]{5}"
+      maxlength="6"
+      placeholder="{{ block.settings.placeholder | escape }}"
+      required
+    >
+    <button type="submit" class="button button-secondary delivery-estimate__button">
+      {{ block.settings.button_label | escape }}
+    </button>
+  </form>
+
+  <p class="delivery-estimate__result" role="status" aria-live="polite" hidden></p>
+</delivery-estimate>
+
+{% stylesheet %}
+  .delivery-estimate {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    width: 100%;
+  }
+
+  .delivery-estimate__heading {
+    margin: 0;
+    font-weight: var(--font-weight-bold, 600);
+  }
+
+  .delivery-estimate__form {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  .delivery-estimate__input {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 0.75rem 1rem;
+    border: var(--style-border-width-inputs, 1px) solid var(--color-input-border, rgb(var(--color-foreground-rgb) / 0.3));
+    border-radius: var(--style-border-radius-inputs, 4px);
+    background: var(--color-input-background, transparent);
+    color: var(--color-input-text, inherit);
+    font: inherit;
+  }
+
+  .delivery-estimate__button {
+    flex: 0 0 auto;
+  }
+
+  .delivery-estimate__result {
+    margin: 0;
+  }
+
+  .delivery-estimate__result[data-state='error'] {
+    color: var(--color-error, #b3261e);
+  }
+{% endstylesheet %}
+
+{% javascript %}
+  if (!customElements.get('delivery-estimate')) {
+    const STORAGE_KEY = 'delivery-estimate-pin';
+
+    class DeliveryEstimate extends HTMLElement {
+      connectedCallback() {
+        this.form = this.querySelector('form');
+        this.input = this.querySelector('input');
+        this.result = this.querySelector('.delivery-estimate__result');
+        this.form.addEventListener('submit', this.#onSubmit);
+
+        try {
+          const saved = localStorage.getItem(STORAGE_KEY);
+          if (saved) {
+            this.input.value = saved;
+            this.#check(saved);
+          }
+        } catch {}
+      }
+
+      disconnectedCallback() {
+        this.form?.removeEventListener('submit', this.#onSubmit);
+      }
+
+      #onSubmit = (event) => {
+        event.preventDefault();
+        this.#check(this.input.value.trim());
+      };
+
+      async #check(pin) {
+        if (!/^[1-9][0-9]{5}$/.test(pin)) {
+          this.#show('Please enter a valid 6-digit pincode.', 'error');
+          return;
+        }
+
+        const { endpoint, originPin, mot } = this.dataset;
+        if (!endpoint || !originPin) {
+          this.#show('Delivery estimate is not configured yet.', 'error');
+          return;
+        }
+
+        this.#show('Checking…', 'loading');
+
+        const pickup = this.#pickupDate();
+        const url = new URL(endpoint);
+        url.searchParams.set('origin_pin', originPin);
+        url.searchParams.set('destination_pin', pin);
+        url.searchParams.set('mot', mot || 'S');
+        url.searchParams.set('pdt', 'B2C');
+        url.searchParams.set('expected_pickup_date', this.#formatPickup(pickup));
+
+        try {
+          const response = await fetch(url, { headers: { Accept: 'application/json' } });
+          const data = await response.json();
+          const tat = this.#extractTat(data);
+
+          if (!response.ok || tat == null) {
+            this.#show('Sorry, we could not find delivery to this pincode.', 'error');
+            return;
+          }
+
+          try {
+            localStorage.setItem(STORAGE_KEY, pin);
+          } catch {}
+
+          const delivery = new Date(pickup);
+          delivery.setDate(delivery.getDate() + tat);
+          const formatted = delivery.toLocaleDateString(document.documentElement.lang || 'en-IN', {
+            weekday: 'short',
+            day: 'numeric',
+            month: 'short',
+          });
+          const template = this.dataset.successText || 'Estimated delivery by [date]';
+          this.#show(template.replace('[date]', formatted).replace('[pincode]', pin), 'success');
+        } catch {
+          this.#show('Could not fetch delivery estimate. Please try again.', 'error');
+        }
+      }
+
+      // Delhivery returns TAT (in days) under data.tat; tolerate a few shapes.
+      #extractTat(data) {
+        const candidates = [data?.data?.tat, data?.tat, data?.data?.expected_tat, data?.expected_tat];
+        for (const value of candidates) {
+          const days = Number(value);
+          if (Number.isFinite(days) && days >= 0) return Math.ceil(days);
+        }
+        return null;
+      }
+
+      // Pickup = today (or tomorrow after cutoff) + processing days, skipping Sundays.
+      #pickupDate() {
+        const date = new Date();
+        const cutoff = Number(this.dataset.cutoffHour || 14);
+        let days = Number(this.dataset.processingDays || 0);
+        if (date.getHours() >= cutoff) days += 1;
+
+        while (date.getDay() === 0) date.setDate(date.getDate() + 1);
+        while (days > 0) {
+          date.setDate(date.getDate() + 1);
+          if (date.getDay() !== 0) days -= 1;
+        }
+        date.setHours(Math.max(date.getHours(), 11), 0, 0, 0);
+        return date;
+      }
+
+      #formatPickup(date) {
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:00`;
+      }
+
+      #show(message, state) {
+        this.result.hidden = false;
+        this.result.textContent = message;
+        this.result.dataset.state = state;
+      }
+    }
+
+    customElements.define('delivery-estimate', DeliveryEstimate);
+  }
+{% endjavascript %}
+
+{% schema %}
+{
+  "name": "Delivery estimate",
+  "tag": null,
+  "settings": [
+    {
+      "type": "paragraph",
+      "content": "Shows an estimated delivery date using the Delhivery Expected TAT API. Requires the proxy in delhivery-proxy/worker.js so your API token stays private."
+    },
+    {
+      "type": "url",
+      "id": "proxy_url",
+      "label": "Proxy URL",
+      "info": "e.g. https://delhivery-tat.your-name.workers.dev"
+    },
+    {
+      "type": "text",
+      "id": "origin_pin",
+      "label": "Warehouse (origin) pincode",
+      "default": "110001"
+    },
+    {
+      "type": "select",
+      "id": "mot",
+      "label": "Shipping mode",
+      "options": [
+        { "value": "S", "label": "Surface" },
+        { "value": "E", "label": "Express" }
+      ],
+      "default": "S"
+    },
+    {
+      "type": "range",
+      "id": "processing_days",
+      "label": "Order processing days",
+      "min": 0,
+      "max": 7,
+      "step": 1,
+      "default": 1
+    },
+    {
+      "type": "range",
+      "id": "cutoff_hour",
+      "label": "Same-day dispatch cutoff (hour, 24h)",
+      "min": 0,
+      "max": 23,
+      "step": 1,
+      "default": 14
+    },
+    {
+      "type": "header",
+      "content": "Text"
+    },
+    {
+      "type": "text",
+      "id": "heading",
+      "label": "Heading",
+      "default": "Check delivery date"
+    },
+    {
+      "type": "text",
+      "id": "placeholder",
+      "label": "Input placeholder",
+      "default": "Enter pincode"
+    },
+    {
+      "type": "text",
+      "id": "button_label",
+      "label": "Button label",
+      "default": "Check"
+    },
+    {
+      "type": "text",
+      "id": "success_text",
+      "label": "Success message",
+      "info": "Use [date] and [pincode] placeholders",
+      "default": "Estimated delivery by [date]"
+    },
+    {
+      "type": "header",
+      "content": "Padding"
+    },
+    {
+      "type": "range",
+      "id": "padding-block-start",
+      "label": "Top",
+      "min": 0,
+      "max": 100,
+      "step": 1,
+      "unit": "px",
+      "default": 0
+    },
+    {
+      "type": "range",
+      "id": "padding-block-end",
+      "label": "Bottom",
+      "min": 0,
+      "max": 100,
+      "step": 1,
+      "unit": "px",
+      "default": 0
+    },
+    {
+      "type": "range",
+      "id": "padding-inline-start",
+      "label": "Left",
+      "min": 0,
+      "max": 100,
+      "step": 1,
+      "unit": "px",
+      "default": 0
+    },
+    {
+      "type": "range",
+      "id": "padding-inline-end",
+      "label": "Right",
+      "min": 0,
+      "max": 100,
+      "step": 1,
+      "unit": "px",
+      "default": 0
+    }
+  ],
+  "presets": [
+    {
+      "name": "Delivery estimate",
+      "category": "t:categories.product"
+    }
+  ]
+}
+{% endschema %}
